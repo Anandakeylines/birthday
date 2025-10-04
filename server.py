@@ -21,6 +21,11 @@ import asyncio
 import re
 from datetime import datetime as dt
 import shutil
+import json
+import pytz
+import random
+import secrets
+import string
 
 
 ROOT_DIR = Path(__file__).parent
@@ -39,6 +44,9 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30 * 24 * 60  # 30 days
 
 # LLM settings
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY')
+
+# Admin Captcha Storage (in-memory, for production use Redis)
+captcha_store = {}
 
 # Create the main app without a prefix
 app = FastAPI(title="Birthday Reminder SaaS")
@@ -101,6 +109,8 @@ class TemplateCreate(BaseModel):
     subject: Optional[str] = None
     content: str
     is_default: bool = False
+    whatsapp_image_url: Optional[str] = None  # Default WhatsApp image
+    email_image_url: Optional[str] = None     # Default Email image
 
 class Template(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -110,6 +120,8 @@ class Template(BaseModel):
     subject: Optional[str] = None
     content: str
     is_default: bool = False
+    whatsapp_image_url: Optional[str] = None  # Default WhatsApp image
+    email_image_url: Optional[str] = None     # Default Email image
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class GenerateMessageRequest(BaseModel):
@@ -163,6 +175,25 @@ class TestMessageRequest(BaseModel):
     contact_id: str
     occasion: str
 
+class ReminderLog(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    date: str  # YYYY-MM-DD format
+    execution_time: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    total_users: int = 0
+    messages_sent: int = 0
+    whatsapp_sent: int = 0
+    email_sent: int = 0
+    errors: List[str] = []
+
+class DailyReminderStats(BaseModel):
+    date: str
+    total_executions: int
+    total_users_processed: int
+    total_messages_sent: int
+    whatsapp_messages: int
+    email_messages: int
+    errors: List[str]
+
 class UserProfileUpdate(BaseModel):
     full_name: Optional[str] = None
     email: Optional[EmailStr] = None
@@ -178,6 +209,7 @@ class BulkUploadResponse(BaseModel):
 class UserSettingsCreate(BaseModel):
     # DigitalSMS API
     digitalsms_api_key: Optional[str] = None
+    whatsapp_sender_number: Optional[str] = None  # 10-digit sender phone number
     
     # Email settings
     email_api_key: Optional[str] = None
@@ -196,6 +228,7 @@ class UserSettings(BaseModel):
     
     # DigitalSMS API
     digitalsms_api_key: Optional[str] = None
+    whatsapp_sender_number: Optional[str] = None  # 10-digit sender phone number
     
     # Email settings
     email_api_key: Optional[str] = None
@@ -250,6 +283,42 @@ class AdminDashboardStats(BaseModel):
     recent_signups: int  # Last 30 days
     churn_rate: float
 
+# New Admin System Models
+class AdminUser(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    username: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class CaptchaResponse(BaseModel):
+    captcha_id: str
+    question: str
+
+class UserWithContactCount(BaseModel):
+    id: str
+    email: str
+    full_name: str
+    phone_number: Optional[str]
+    subscription_status: str
+    whatsapp_credits: int
+    email_credits: int
+    unlimited_whatsapp: bool
+    unlimited_email: bool
+    created_at: datetime
+    contact_count: int
+
+class UserUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    company: Optional[str] = None
+    phone_number: Optional[str] = None
+
+class SubscriptionUpdateRequest(BaseModel):
+    subscription_status: Optional[str] = None
+    whatsapp_credits: Optional[int] = None
+    email_credits: Optional[int] = None
+    unlimited_whatsapp: Optional[bool] = None
+    unlimited_email: Optional[bool] = None
+
 # Helper functions
 def hash_password(password: str) -> str:
     salt = bcrypt.gensalt()
@@ -264,6 +333,79 @@ def create_access_token(data: dict):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+async def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify admin authentication"""
+    try:
+        print("=== get_current_admin called ===")
+        token = credentials.credentials
+        print(f"Token: {token[:50]}...")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        print(f"Payload: {payload}")
+        admin_id: str = payload.get("admin_id")
+        print(f"Admin ID from token: {admin_id}")
+        if admin_id is None:
+            raise HTTPException(status_code=401, detail="Invalid admin credentials")
+        
+        admin = await db.admins.find_one({"id": admin_id})
+        print(f"Admin from DB: {admin}")
+        if not admin:
+            raise HTTPException(status_code=401, detail="Admin not found")
+        
+        # Parse MongoDB data
+        admin = parse_from_mongo(admin)
+        print(f"Admin after parse: {admin}")
+        admin_user = AdminUser(**admin)
+        print(f"AdminUser created: {admin_user}")
+        return admin_user
+    except JWTError as e:
+        print(f"JWT Error in get_current_admin: {str(e)}")
+        raise HTTPException(status_code=401, detail="Could not validate admin credentials")
+    except Exception as e:
+        print(f"Error in get_current_admin: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=401, detail=f"Authentication error: {str(e)}")
+
+def generate_math_captcha():
+    """Generate a simple math captcha"""
+    num1 = random.randint(1, 10)
+    num2 = random.randint(1, 10)
+    captcha_id = str(uuid.uuid4())
+    answer = num1 + num2
+    
+    # Store captcha with 5 minute expiration
+    captcha_store[captcha_id] = {
+        "answer": answer,
+        "created_at": datetime.now(timezone.utc)
+    }
+    
+    # Clean old captchas
+    current_time = datetime.now(timezone.utc)
+    expired_keys = [
+        key for key, value in captcha_store.items()
+        if (current_time - value["created_at"]).total_seconds() > 300
+    ]
+    for key in expired_keys:
+        del captcha_store[key]
+    
+    return {
+        "captcha_id": captcha_id,
+        "question": f"What is {num1} + {num2}?"
+    }
+
+def verify_captcha(captcha_id: str, answer: str) -> bool:
+    """Verify captcha answer"""
+    if captcha_id not in captcha_store:
+        return False
+    
+    stored_data = captcha_store[captcha_id]
+    is_valid = str(stored_data["answer"]) == answer
+    
+    # Remove captcha after verification attempt
+    del captcha_store[captcha_id]
+    
+    return is_valid
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
@@ -296,8 +438,15 @@ def prepare_for_mongo(data):
 
 def parse_from_mongo(item):
     if isinstance(item, dict):
+        # Handle MongoDB ObjectId conversion
+        if '_id' in item:
+            del item['_id']  # Remove MongoDB _id field
+        
         for key, value in item.items():
-            if key in ['birthday', 'anniversary_date'] and isinstance(value, str):
+            # Convert ObjectId to string if present
+            if hasattr(value, '__class__') and value.__class__.__name__ == 'ObjectId':
+                item[key] = str(value)
+            elif key in ['birthday', 'anniversary_date'] and isinstance(value, str):
                 try:
                     item[key] = datetime.fromisoformat(value).date()
                 except:
@@ -381,11 +530,35 @@ async def update_user_profile(profile_data: UserProfileUpdate, current_user: Use
         update_fields["email"] = str(profile_data.email).lower()
     
     if profile_data.phone_number is not None:
-        # Basic phone number validation
+        # Country-specific phone number validation
         phone = profile_data.phone_number.strip()
-        if phone and not phone.replace("+", "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "").isdigit():
-            raise HTTPException(status_code=400, detail="Invalid phone number format")
-        update_fields["phone_number"] = phone if phone else None
+        if phone:
+            # Clean the phone number - remove spaces, dashes, parentheses
+            cleaned_phone = phone.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+            
+            # Remove +91 country code for India if present
+            if cleaned_phone.startswith("+91"):
+                cleaned_phone = cleaned_phone[3:]
+            elif cleaned_phone.startswith("91") and len(cleaned_phone) == 12:
+                cleaned_phone = cleaned_phone[2:]
+            
+            # Validate for Indian phone numbers (10 digits)
+            if cleaned_phone:
+                if not cleaned_phone.isdigit():
+                    raise HTTPException(status_code=400, detail="Phone number must contain only digits")
+                
+                if len(cleaned_phone) != 10:
+                    raise HTTPException(status_code=400, detail="Indian phone numbers must be exactly 10 digits")
+                
+                # Additional validation for Indian mobile numbers (should start with 6-9)
+                if not cleaned_phone[0] in ['6', '7', '8', '9']:
+                    raise HTTPException(status_code=400, detail="Indian mobile numbers must start with 6, 7, 8, or 9")
+                
+                update_fields["phone_number"] = cleaned_phone
+            else:
+                update_fields["phone_number"] = None
+        else:
+            update_fields["phone_number"] = None
     
     if not update_fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
@@ -396,7 +569,8 @@ async def update_user_profile(profile_data: UserProfileUpdate, current_user: Use
         {"$set": update_fields}
     )
     
-    if result.modified_count == 0:
+    # Check if user exists (matched_count > 0 means user was found)
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
     
     # Fetch and return updated user
@@ -926,43 +1100,7 @@ async def get_admin_dashboard(admin_user: User = Depends(get_admin_user)):
         churn_rate=churn_rate
     )
 
-@api_router.get("/admin/users", response_model=List[UserStats])
-async def get_all_users_with_stats(admin_user: User = Depends(get_admin_user)):
-    users = await db.users.find().to_list(1000)
-    user_stats = []
-    
-    for user in users:
-        user = parse_from_mongo(user)
-        user_id = user['id']
-        
-        # Get user's contact and template counts
-        contacts_count = await db.contacts.count_documents({"user_id": user_id})
-        templates_count = await db.templates.count_documents({"user_id": user_id})
-        
-        # Calculate total usage (contacts + templates)
-        total_usage = contacts_count + templates_count
-        
-        user_stats.append(UserStats(
-            id=user_id,
-            email=user['email'],
-            full_name=user['full_name'],
-            subscription_status=user.get('subscription_status', 'trial'),
-            subscription_expires=user.get('subscription_expires'),
-            is_admin=user.get('is_admin', False),
-            created_at=user['created_at'],
-            contacts_count=contacts_count,
-            templates_count=templates_count,
-            last_login=user.get('last_login'),
-            total_usage=total_usage,
-            whatsapp_credits=user.get('whatsapp_credits', 0),
-            email_credits=user.get('email_credits', 0),
-            unlimited_whatsapp=user.get('unlimited_whatsapp', False),
-            unlimited_email=user.get('unlimited_email', False)
-        ))
-    
-    # Sort by total usage descending
-    user_stats.sort(key=lambda x: x.total_usage, reverse=True)
-    return user_stats
+# Duplicate endpoint removed - using enhanced version below
 
 @api_router.put("/admin/users/{user_id}/subscription")
 async def update_user_subscription(user_id: str, subscription_status: str, admin_user: User = Depends(get_admin_user)):
@@ -1151,47 +1289,66 @@ async def update_user_settings(settings_data: UserSettingsCreate, current_user: 
 
 @api_router.post("/settings/test-whatsapp")
 async def test_whatsapp_config(current_user: User = Depends(get_current_user)):
+    """Send actual test WhatsApp message to user's phone number"""
     settings = await db.user_settings.find_one({"user_id": current_user.id})
     
     if not settings:
-        raise HTTPException(status_code=400, detail="Settings not found")
+        return {"status": "error", "message": "WhatsApp settings not found"}
+    
+    # Check if required configuration is present
+    api_key = settings.get("digitalsms_api_key")
+    sender_number = settings.get("whatsapp_sender_number")
+    
+    if not api_key:
+        return {"status": "error", "message": "DigitalSMS API key not configured"}
+    
+    if not sender_number:
+        return {"status": "error", "message": "WhatsApp sender phone number not configured"}
+    
+    # Get user's phone number from profile
+    user = await db.users.find_one({"id": current_user.id})
+    if not user:
+        return {"status": "error", "message": "User profile not found"}
+    
+    user_phone = user.get("phone_number")
+    if not user_phone:
+        return {"status": "error", "message": "Please add your phone number in Account settings to receive test messages"}
+    
+    # Validate user's phone number format
+    if len(user_phone) != 10 or not user_phone.isdigit() or user_phone[0] not in ['6', '7', '8', '9']:
+        return {"status": "error", "message": "Invalid phone number in your profile. Please update it in Account settings"}
     
     try:
-        import requests
+        # Send actual test message using our WhatsApp function
+        test_message = f"🧪 WhatsApp Test from ReminderAI\n\n✅ Your DigitalSMS API configuration is working perfectly!\n\nAPI Key: {api_key[:8]}...\nSender Number: {sender_number}\nTest sent at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n🎉 You're all set to send birthday and anniversary reminders!"
         
-        # Test DigitalSMS API
-        api_key = settings.get("digitalsms_api_key")
+        result = await send_whatsapp_message(
+            user_id=current_user.id,
+            phone_number=user_phone,
+            message=test_message,
+            occasion="birthday"  # Default for test messages
+        )
         
-        if not api_key:
-            return {"status": "error", "message": "DigitalSMS API key not configured"}
-        
-        url = "https://demo.digitalsms.biz/api/"
-        params = {
-            "apikey": api_key,
-            "mobile": "1234567890",  # Test mobile number (won't actually send)
-            "msg": "Test configuration from ReminderAI - Your DigitalSMS API is working correctly!"
-        }
-        
-        # Make test request
-        response = requests.get(url, params=params)
-        
-        # DigitalSMS API response handling
-        if response.status_code == 200:
-            response_text = response.text.strip()
-            
-            # Check for success indicators
-            if any(indicator in response_text.lower() for indicator in ["success", "sent", "ok", "delivered", "queued"]):
-                return {"status": "success", "message": f"DigitalSMS API is valid. Response: {response_text}", "provider": "digitalsms"}
-            elif any(error in response_text.lower() for error in ["invalid", "error", "fail", "unauthorized", "forbidden"]):
-                return {"status": "error", "message": f"DigitalSMS API test failed: {response_text}"}
-            else:
-                # If we get a response but can't determine success/failure, assume it's working
-                return {"status": "success", "message": f"DigitalSMS API responded: {response_text}", "provider": "digitalsms"}
+        if result["status"] == "success":
+            return {
+                "status": "success", 
+                "message": f"Test message sent successfully to {user_phone}! Check your WhatsApp.",
+                "provider": "digitalsms",
+                "details": {
+                    "recipient": user_phone,
+                    "sender": sender_number,
+                    "api_response": result["message"]
+                }
+            }
         else:
-            return {"status": "error", "message": f"DigitalSMS API HTTP error {response.status_code}: {response.text}"}
+            return {
+                "status": "error", 
+                "message": f"Failed to send test message: {result['message']}",
+                "provider": "digitalsms"
+            }
             
     except Exception as e:
-        return {"status": "error", "message": f"WhatsApp API test error: {str(e)}"}
+        return {"status": "error", "message": f"WhatsApp test error: {str(e)}"}
 
 @api_router.post("/settings/test-email")
 async def test_email_config(current_user: User = Depends(get_current_user)):
@@ -1288,9 +1445,18 @@ async def deduct_credits(message_type: str, count: int = 1, current_user: User =
         "credits_remaining": new_credits
     }
 
+# Default celebration images
+def get_default_celebration_image(occasion: str = "birthday") -> str:
+    """Get default celebration image based on occasion"""
+    default_images = {
+        "birthday": "https://images.unsplash.com/photo-1530103862676-de8c9debad1d?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2Njl8MHwxfHNlYXJjaHwxfHxiaXJ0aGRheSUyMGNlbGVicmF0aW9ufGVufDB8fHx8MTc1OTQ4ODk0Nnww&ixlib=rb-4.1.0&q=85&w=400&h=400&fit=crop",
+        "anniversary": "https://images.unsplash.com/photo-1599073499036-dc27fc297dc9?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NjZ8MHwxfHNlYXJjaHwyfHxhbm5pdmVyc2FyeSUyMGNlbGVicmF0aW9ufGVufDB8fHx8MTc1OTQ4ODk1MXww&ixlib=rb-4.1.0&q=85&w=400&h=400&fit=crop",
+    }
+    return default_images.get(occasion.lower(), default_images["birthday"])
+
 # WhatsApp Message Sending Functions
-async def send_whatsapp_message(user_id: str, phone_number: str, message: str, image_url: Optional[str] = None):
-    """Send WhatsApp message using DigitalSMS API"""
+async def send_whatsapp_message(user_id: str, phone_number: str, message: str, image_url: Optional[str] = None, occasion: str = "birthday"):
+    """Send WhatsApp message using DigitalSMS API according to official documentation"""
     settings = await db.user_settings.find_one({"user_id": user_id})
     
     if not settings:
@@ -1304,39 +1470,98 @@ async def send_whatsapp_message(user_id: str, phone_number: str, message: str, i
         if not api_key:
             return {"status": "error", "message": "DigitalSMS API key not configured"}
         
-        url = "https://demo.digitalsms.biz/api/"
+        # DigitalSMS API endpoint as per documentation
+        url = "https://demo.digitalsms.biz/api"
         
-        # Prepare message - if image is provided, include it as a link in the text
-        final_message = message
-        if image_url:
-            # Convert relative URL to absolute if needed
-            if image_url.startswith('/'):
-                # Assume it's a local upload, convert to full URL
-                final_message = f"{message}\n\n📷 Image: https://birthday-buddy-16.preview.emergentagent.com{image_url}"
-            else:
-                final_message = f"{message}\n\n📷 Image: {image_url}"
+        # Clean phone number - DigitalSMS expects 10-digit Indian mobile number
+        clean_phone = phone_number.replace("+91", "").replace("+", "").replace(" ", "").replace("-", "")
+        if len(clean_phone) > 10:
+            clean_phone = clean_phone[-10:]  # Take last 10 digits
         
+        # Prepare API parameters according to DigitalSMS documentation
         params = {
             "apikey": api_key,
-            "mobile": phone_number,
-            "msg": final_message
+            "mobile": clean_phone,
+            "msg": message
         }
         
-        response = requests.get(url, params=params)
+        # For now, skip images entirely to isolate the 407 error issue
+        # We'll add image support back once basic messaging works
+        # TODO: Add image support back after resolving 407 error
+        
+        # Temporarily commenting out image logic:
+        # if image_url and image_url.strip():
+        #     # Convert relative URL to absolute if needed
+        #     if image_url.startswith('/'):
+        #         absolute_image_url = f"https://remindhub-5.preview.emergentagent.com{image_url}"
+        #     elif image_url.startswith('http'):
+        #         absolute_image_url = image_url
+        #     else:
+        #         # Skip image if not a valid URL format
+        #         absolute_image_url = None
+        #     
+        #     # Only add image if we have a valid URL and it's accessible
+        #     if absolute_image_url:
+        #         try:
+        #             import requests
+        #             # Quick HEAD request to check if image is accessible
+        #             head_response = requests.head(absolute_image_url, timeout=5)
+        #             if head_response.status_code == 200:
+        #                 params["img1"] = absolute_image_url
+        #             # If image is not accessible, don't include img1 parameter
+        #         except:
+        #             # If validation fails, don't include img1 parameter
+        #             pass
+        # If no valid image, don't include img1 parameter (send text-only message)
+        
+        # Log request details for debugging (remove img1 from logs for brevity)
+        debug_params = {k: v for k, v in params.items() if k != "img1"}
+        debug_params["has_image"] = "img1" in params
+        print(f"DigitalSMS API Request - URL: {url}, Params: {debug_params}")
+        
+        # Make API request (GET method as per documentation)
+        response = requests.get(url, params=params, timeout=30)
+        
+        # Log response for debugging
+        print(f"DigitalSMS API Response - Status: {response.status_code}, Body: {response.text[:200]}...")
         
         if response.status_code == 200:
-            response_text = response.text.strip()
-            
-            # Check for success indicators in DigitalSMS response
-            if any(indicator in response_text.lower() for indicator in ["success", "sent", "ok", "delivered", "queued"]):
-                return {"status": "success", "message": f"Message sent via DigitalSMS API. Response: {response_text}"}
-            elif any(error in response_text.lower() for error in ["invalid", "error", "fail", "unauthorized", "forbidden", "insufficient"]):
-                return {"status": "error", "message": f"DigitalSMS API error: {response_text}"}
-            else:
-                # If response is unclear, log it but assume success if HTTP 200
-                return {"status": "success", "message": f"Message sent via DigitalSMS API. Server response: {response_text}"}
+            try:
+                # Try to parse JSON response
+                response_data = response.json()
+                status = response_data.get("status", 0)
+                message_text = response_data.get("message", "")
+                statuscode = response_data.get("statuscode", "")
+                
+                if status == 1:
+                    return {"status": "success", "message": f"Message sent successfully. Response: {message_text}"}
+                else:
+                    # Provide specific error messages for common issues
+                    if statuscode == 403:
+                        error_msg = "Invalid or expired DigitalSMS API key. Please check your API key in Settings."
+                    elif statuscode == 407:
+                        error_msg = "Proxy authentication error. Please check your DigitalSMS API configuration."
+                    elif statuscode == 400:
+                        error_msg = "Invalid request format. Please check phone number and message content."
+                    else:
+                        error_msg = f"DigitalSMS API error (Code: {statuscode}): {message_text}"
+                    
+                    return {"status": "error", "message": error_msg}
+                    
+            except json.JSONDecodeError:
+                # Fallback to text response parsing
+                response_text = response.text.strip()
+                
+                # Check for success indicators
+                if any(indicator in response_text.lower() for indicator in ["success", "sent", "ok", "delivered", "queued"]):
+                    return {"status": "success", "message": f"Message sent via DigitalSMS API. Response: {response_text}"}
+                elif any(error in response_text.lower() for error in ["invalid", "error", "fail", "unauthorized", "forbidden", "insufficient"]):
+                    return {"status": "error", "message": f"DigitalSMS API error: {response_text} | Debug: {debug_params}"}
+                else:
+                    # If response is unclear, assume success if HTTP 200
+                    return {"status": "success", "message": f"Message sent via DigitalSMS API. Server response: {response_text}"}
         else:
-            return {"status": "error", "message": f"DigitalSMS API HTTP error {response.status_code}: {response.text}"}
+            return {"status": "error", "message": f"DigitalSMS API HTTP error {response.status_code}: {response.text} | Debug: {debug_params}"}
             
     except Exception as e:
         return {"status": "error", "message": f"WhatsApp sending error: {str(e)}"}
@@ -1352,7 +1577,8 @@ async def send_test_whatsapp_message(phone_number: str, current_user: User = Dep
     result = await send_whatsapp_message(
         user_id=current_user.id,
         phone_number=clean_phone,
-        message=f"🎉 Test message from ReminderAI! Your WhatsApp API configuration is working perfectly. This message was sent to {phone_number}."
+        message=f"🎉 Test message from ReminderAI! Your WhatsApp API configuration is working perfectly. This message was sent to {phone_number}.",
+        occasion="birthday"  # Default for test messages
     )
     return result
 
@@ -1488,6 +1714,19 @@ async def send_test_message(request: TestMessageRequest, current_user: User = De
     # Get user settings for test contact information
     settings = await db.user_settings.find_one({"user_id": current_user.id})
     
+    # Get template defaults for fallback images
+    whatsapp_template = await db.templates.find_one({
+        "user_id": current_user.id,
+        "type": "whatsapp",
+        "is_default": True
+    })
+    
+    email_template = await db.templates.find_one({
+        "user_id": current_user.id,
+        "type": "email", 
+        "is_default": True
+    })
+
     # Get custom messages or generate defaults
     whatsapp_message_data = await db.custom_messages.find_one({
         "user_id": current_user.id,
@@ -1513,10 +1752,21 @@ async def send_test_message(request: TestMessageRequest, current_user: User = De
         )
         ai_message = await generate_message(message_request, current_user)
         whatsapp_message = ai_message.message
-        whatsapp_image = contact.get("whatsapp_image")
+        
+        # Image hierarchy: contact image -> template default image
+        whatsapp_image = (
+            contact.get("whatsapp_image") or 
+            (whatsapp_template.get("whatsapp_image_url") if whatsapp_template else None)
+        )
     else:
         whatsapp_message = whatsapp_message_data["custom_message"]
-        whatsapp_image = whatsapp_message_data.get("image_url") or contact.get("whatsapp_image")
+        
+        # Image hierarchy: custom message image -> contact image -> template default image
+        whatsapp_image = (
+            whatsapp_message_data.get("image_url") or 
+            contact.get("whatsapp_image") or
+            (whatsapp_template.get("whatsapp_image_url") if whatsapp_template else None)
+        )
     
     if not email_message_data:
         message_request = GenerateMessageRequest(
@@ -1527,10 +1777,21 @@ async def send_test_message(request: TestMessageRequest, current_user: User = De
         )
         ai_message = await generate_message(message_request, current_user)
         email_message = ai_message.message
-        email_image = contact.get("email_image")
+        
+        # Image hierarchy: contact image -> template default image
+        email_image = (
+            contact.get("email_image") or
+            (email_template.get("email_image_url") if email_template else None)
+        )
     else:
         email_message = email_message_data["custom_message"]
-        email_image = email_message_data.get("image_url") or contact.get("email_image")
+        
+        # Image hierarchy: custom message image -> contact image -> template default image
+        email_image = (
+            email_message_data.get("image_url") or
+            contact.get("email_image") or
+            (email_template.get("email_image_url") if email_template else None)
+        )
     
     # Send test WhatsApp message to user's phone (if they have WhatsApp configured and phone number in their profile)
     if contact.get("whatsapp"):
@@ -1540,7 +1801,8 @@ async def send_test_message(request: TestMessageRequest, current_user: User = De
             user_id=current_user.id,
             phone_number=contact["whatsapp"],
             message=test_whatsapp_message,
-            image_url=whatsapp_image
+            image_url=whatsapp_image,
+            occasion=request.occasion
         )
         results["whatsapp"] = whatsapp_result
     
@@ -1645,8 +1907,8 @@ async def upload_image(file: UploadFile = File(...), current_user: User = Depend
     with open(file_path, "wb") as buffer:
         buffer.write(file_content)
     
-    # Return file URL
-    file_url = f"/uploads/images/{unique_filename}"
+    # Return full file URL with domain
+    file_url = f"https://remindhub-5.preview.emergentagent.com/uploads/images/{unique_filename}"
     return {"image_url": file_url, "filename": unique_filename}
 
 @api_router.put("/contacts/{contact_id}/images")
@@ -1677,8 +1939,7 @@ async def update_contact_images(
     
     return {"message": "Contact images updated successfully"}
 
-# Include the router in the main app
-app.include_router(api_router)
+# Router will be included after all endpoints are defined
 
 # Create uploads directory
 uploads_dir = Path("uploads")
@@ -1706,7 +1967,974 @@ logger = logging.getLogger(__name__)
 async def shutdown_db_client():
     client.close()
 
+# Daily Reminder System
+async def get_contact_message_for_reminder(user_id: str, contact_id: str, occasion: str):
+    """Get appropriate message and image for reminder with hierarchy logic"""
+    
+    # Get template defaults for fallback images
+    whatsapp_template = await db.templates.find_one({
+        "user_id": user_id,
+        "type": "whatsapp",
+        "is_default": True
+    })
+    
+    email_template = await db.templates.find_one({
+        "user_id": user_id,
+        "type": "email", 
+        "is_default": True
+    })
+    
+    # Get contact info
+    contact = await db.contacts.find_one({"id": contact_id, "user_id": user_id})
+    if not contact:
+        return None
+    
+    contact = parse_from_mongo(contact)
+    
+    # Get custom messages
+    whatsapp_message_data = await db.custom_messages.find_one({
+        "user_id": user_id,
+        "contact_id": contact_id,
+        "occasion": occasion,
+        "message_type": "whatsapp"
+    })
+    
+    email_message_data = await db.custom_messages.find_one({
+        "user_id": user_id,
+        "contact_id": contact_id,
+        "occasion": occasion,
+        "message_type": "email"
+    })
+    
+    # Generate WhatsApp message and image
+    if whatsapp_message_data:
+        whatsapp_message = whatsapp_message_data["custom_message"]
+        whatsapp_image = (
+            whatsapp_message_data.get("image_url") or 
+            contact.get("whatsapp_image") or
+            (whatsapp_template.get("whatsapp_image_url") if whatsapp_template else None)
+        )
+    else:
+        # Generate AI message
+        try:
+            # Get user for AI generation
+            user = await db.users.find_one({"id": user_id})
+            if user:
+                user = User(**parse_from_mongo(user))
+                message_request = GenerateMessageRequest(
+                    contact_name=contact["name"],
+                    occasion=occasion,
+                    relationship="friend",
+                    tone=contact.get("message_tone", "normal")
+                )
+                ai_message = await generate_message(message_request, user)
+                whatsapp_message = ai_message.message
+            else:
+                whatsapp_message = f"Happy {occasion}, {contact['name']}! 🎉"
+        except:
+            whatsapp_message = f"Happy {occasion}, {contact['name']}! 🎉"
+        
+        whatsapp_image = (
+            contact.get("whatsapp_image") or
+            (whatsapp_template.get("whatsapp_image_url") if whatsapp_template else None)
+        )
+    
+    # Generate Email message and image
+    if email_message_data:
+        email_message = email_message_data["custom_message"]
+        email_image = (
+            email_message_data.get("image_url") or
+            contact.get("email_image") or
+            (email_template.get("email_image_url") if email_template else None)
+        )
+    else:
+        # Generate AI message
+        try:
+            # Get user for AI generation
+            user = await db.users.find_one({"id": user_id})
+            if user:
+                user = User(**parse_from_mongo(user))
+                message_request = GenerateMessageRequest(
+                    contact_name=contact["name"],
+                    occasion=occasion,
+                    relationship="friend",
+                    tone=contact.get("message_tone", "normal")
+                )
+                ai_message = await generate_message(message_request, user)
+                email_message = ai_message.message
+            else:
+                email_message = f"Happy {occasion}, {contact['name']}! 🎉"
+        except:
+            email_message = f"Happy {occasion}, {contact['name']}! 🎉"
+        
+        email_image = (
+            contact.get("email_image") or
+            (email_template.get("email_image_url") if email_template else None)
+        )
+    
+    return {
+        "whatsapp_message": whatsapp_message,
+        "whatsapp_image": whatsapp_image,
+        "email_message": email_message,
+        "email_image": email_image,
+        "contact": contact
+    }
+
+async def send_email_reminder(user_id: str, contact: dict, occasion: str, message: str, image_url: Optional[str] = None):
+    """Send email reminder using Brevo API"""
+    
+    settings = await db.user_settings.find_one({"user_id": user_id})
+    if not settings:
+        return {"status": "error", "message": "Email settings not found"}
+    
+    api_key = settings.get("email_api_key")
+    sender_email = settings.get("sender_email")
+    sender_name = settings.get("sender_name", "ReminderAI")
+    
+    if not api_key or not sender_email:
+        return {"status": "error", "message": "Email configuration incomplete"}
+    
+    try:
+        import requests
+        
+        url = "https://api.brevo.com/v3/smtp/email"
+        headers = {
+            "api-key": api_key,
+            "Content-Type": "application/json"
+        }
+        
+        # Create HTML email content
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #e11d48; border-bottom: 2px solid #e11d48; padding-bottom: 10px;">
+                    🎉 {occasion.title()} Reminder
+                </h2>
+                <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                    <div style="background-color: white; padding: 15px; border-radius: 6px; border-left: 4px solid #e11d48;">
+                        {message}
+                    </div>
+                    {f'<img src="{image_url}" style="max-width: 100%; height: auto; margin-top: 15px; border-radius: 6px;" alt="Celebration Image">' if image_url else ''}
+                </div>
+                <p style="font-size: 14px; color: #6b7280; margin-top: 30px;">
+                    Sent with ❤️ by ReminderAI
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        payload = {
+            "sender": {
+                "name": sender_name,
+                "email": sender_email
+            },
+            "to": [
+                {
+                    "email": contact["email"],
+                    "name": contact["name"]
+                }
+            ],
+            "subject": f"🎉 {contact['name']}'s {occasion.title()} Reminder",
+            "htmlContent": html_content
+        }
+        
+        response = requests.post(url, json=payload, headers=headers)
+        
+        if response.status_code == 201:
+            return {"status": "success", "message": "Email sent successfully"}
+        else:
+            return {"status": "error", "message": f"Email API error: {response.text}"}
+            
+    except Exception as e:
+        return {"status": "error", "message": f"Email sending error: {str(e)}"}
+
+async def send_reminder_messages(user: dict, contact: dict, occasion: str, results: dict):
+    """Send WhatsApp and Email reminders for a contact"""
+    try:
+        # Get messages with image hierarchy
+        message_data = await get_contact_message_for_reminder(user["id"], contact["id"], occasion)
+        if not message_data:
+            results["errors"].append(f"Could not generate message for {contact['name']}")
+            return
+        
+        # Send WhatsApp if configured and credits available
+        if (contact.get("whatsapp") and 
+            user.get("whatsapp_credits", 0) > 0 and
+            not user.get("unlimited_whatsapp", False)):
+            
+            whatsapp_result = await send_whatsapp_message(
+                user_id=user["id"],
+                phone_number=contact["whatsapp"],
+                message=message_data["whatsapp_message"],
+                image_url=message_data["whatsapp_image"],
+                occasion=occasion
+            )
+            
+            if whatsapp_result["status"] == "success":
+                results["whatsapp_sent"] += 1
+                results["messages_sent"] += 1
+                # Deduct credit if not unlimited
+                if not user.get("unlimited_whatsapp", False):
+                    await db.users.update_one(
+                        {"id": user["id"]},
+                        {"$inc": {"whatsapp_credits": -1}}
+                    )
+            else:
+                results["errors"].append(f"WhatsApp failed for {contact['name']}: {whatsapp_result['message']}")
+        
+        # Send WhatsApp if unlimited credits
+        elif (contact.get("whatsapp") and user.get("unlimited_whatsapp", False)):
+            whatsapp_result = await send_whatsapp_message(
+                user_id=user["id"],
+                phone_number=contact["whatsapp"],
+                message=message_data["whatsapp_message"],
+                image_url=message_data["whatsapp_image"],
+                occasion=occasion
+            )
+            
+            if whatsapp_result["status"] == "success":
+                results["whatsapp_sent"] += 1
+                results["messages_sent"] += 1
+            else:
+                results["errors"].append(f"WhatsApp failed for {contact['name']}: {whatsapp_result['message']}")
+        
+        # Send Email if configured and credits available
+        if (contact.get("email") and 
+            user.get("email_credits", 0) > 0 and
+            not user.get("unlimited_email", False)):
+            
+            email_result = await send_email_reminder(
+                user_id=user["id"],
+                contact=contact,
+                occasion=occasion,
+                message=message_data["email_message"],
+                image_url=message_data["email_image"]
+            )
+            
+            if email_result["status"] == "success":
+                results["email_sent"] += 1  
+                results["messages_sent"] += 1
+                # Deduct credit if not unlimited
+                if not user.get("unlimited_email", False):
+                    await db.users.update_one(
+                        {"id": user["id"]},
+                        {"$inc": {"email_credits": -1}}
+                    )
+            else:
+                results["errors"].append(f"Email failed for {contact['name']}: {email_result['message']}")
+        
+        # Send Email if unlimited credits
+        elif (contact.get("email") and user.get("unlimited_email", False)):
+            email_result = await send_email_reminder(
+                user_id=user["id"],
+                contact=contact,
+                occasion=occasion,
+                message=message_data["email_message"],
+                image_url=message_data["email_image"]
+            )
+            
+            if email_result["status"] == "success":
+                results["email_sent"] += 1
+                results["messages_sent"] += 1
+            else:
+                results["errors"].append(f"Email failed for {contact['name']}: {email_result['message']}")
+                
+    except Exception as e:
+        results["errors"].append(f"Error processing {contact['name']}: {str(e)}")
+
+@api_router.post("/system/daily-reminders")
+async def process_daily_reminders():
+    """Process all daily birthday/anniversary reminders - Internal system endpoint"""
+    
+    execution_time = datetime.now(timezone.utc)
+    today = execution_time.date()
+    
+    results = {
+        "execution_time": execution_time.isoformat(),
+        "date": today.isoformat(),
+        "total_users": 0,
+        "messages_sent": 0,
+        "whatsapp_sent": 0,
+        "email_sent": 0,
+        "errors": []
+    }
+    
+    try:
+        # Get all users with active subscriptions
+        users = await db.users.find({
+            "subscription_status": {"$in": ["active", "trial"]}
+        }).to_list(1000)
+        
+        for user in users:
+            user = parse_from_mongo(user)
+            user_id = user["id"]
+            results["total_users"] += 1
+            
+            try:
+                # Get user settings for send time and timezone
+                settings = await db.user_settings.find_one({"user_id": user_id})
+                if not settings:
+                    continue
+                    
+                user_timezone = settings.get("timezone", "UTC")
+                daily_send_time = settings.get("daily_send_time", "09:00")
+                
+                # Convert to user's timezone and check if it's time to send
+                try:
+                    user_tz = pytz.timezone(user_timezone)
+                    user_now = execution_time.astimezone(user_tz)
+                    
+                    send_hour, send_minute = map(int, daily_send_time.split(":"))
+                    
+                    # Check if current time is within 15-minute window of user's preferred send time
+                    current_minutes = user_now.hour * 60 + user_now.minute
+                    target_minutes = send_hour * 60 + send_minute
+                    
+                    # Allow 15-minute window (since cron runs every 15 minutes)
+                    if abs(current_minutes - target_minutes) > 15:
+                        continue
+                        
+                except Exception as tz_error:
+                    results["errors"].append(f"Timezone error for user {user['email']}: {str(tz_error)}")
+                    continue
+                
+                # Get contacts for this user
+                contacts = await db.contacts.find({"user_id": user_id}).to_list(1000)
+                
+                for contact in contacts:
+                    contact = parse_from_mongo(contact)
+                    
+                    # Check birthday
+                    if contact.get("birthday"):
+                        try:
+                            birthday = datetime.fromisoformat(contact["birthday"]).date()
+                            if birthday.month == today.month and birthday.day == today.day:
+                                await send_reminder_messages(user, contact, "birthday", results)
+                        except Exception as bd_error:
+                            results["errors"].append(f"Birthday parsing error for {contact['name']}: {str(bd_error)}")
+                    
+                    # Check anniversary
+                    if contact.get("anniversary_date"):
+                        try:
+                            anniversary = datetime.fromisoformat(contact["anniversary_date"]).date()
+                            if anniversary.month == today.month and anniversary.day == today.day:
+                                await send_reminder_messages(user, contact, "anniversary", results)
+                        except Exception as ann_error:
+                            results["errors"].append(f"Anniversary parsing error for {contact['name']}: {str(ann_error)}")
+                            
+            except Exception as user_error:
+                results["errors"].append(f"Error processing user {user.get('email', user_id)}: {str(user_error)}")
+        
+        # Log execution results
+        log_entry = ReminderLog(
+            date=today.isoformat(),
+            execution_time=execution_time,
+            total_users=results["total_users"],
+            messages_sent=results["messages_sent"],
+            whatsapp_sent=results["whatsapp_sent"],
+            email_sent=results["email_sent"],
+            errors=results["errors"]
+        )
+        
+        await db.reminder_logs.insert_one(prepare_for_mongo(log_entry.dict()))
+        
+        return results
+        
+    except Exception as e:
+        results["errors"].append(f"System error: {str(e)}")
+        
+        # Still try to log the execution
+        try:
+            log_entry = ReminderLog(
+                date=today.isoformat(),
+                execution_time=execution_time,
+                total_users=results["total_users"],
+                messages_sent=results["messages_sent"],
+                whatsapp_sent=results["whatsapp_sent"],
+                email_sent=results["email_sent"],
+                errors=results["errors"]
+            )
+            await db.reminder_logs.insert_one(prepare_for_mongo(log_entry.dict()))
+        except:
+            pass
+            
+        return results
+
+@api_router.get("/admin/reminder-stats", response_model=DailyReminderStats)
+async def get_reminder_stats(
+    date: Optional[str] = None, 
+    admin_user: User = Depends(get_admin_user)
+):
+    """Get daily reminder execution statistics for admin dashboard"""
+    
+    if not date:
+        date = datetime.now(timezone.utc).date().isoformat()
+    
+    # Get execution logs for the specified date
+    logs = await db.reminder_logs.find({
+        "date": date
+    }).to_list(100)
+    
+    if not logs:
+        return DailyReminderStats(
+            date=date,
+            total_executions=0,
+            total_users_processed=0,
+            total_messages_sent=0,
+            whatsapp_messages=0,
+            email_messages=0,
+            errors=[]
+        )
+    
+    # Aggregate statistics
+    total_users = sum(log.get("total_users", 0) for log in logs)
+    total_messages = sum(log.get("messages_sent", 0) for log in logs)
+    whatsapp_messages = sum(log.get("whatsapp_sent", 0) for log in logs)
+    email_messages = sum(log.get("email_sent", 0) for log in logs)
+    all_errors = []
+    
+    for log in logs:
+        if log.get("errors"):
+            all_errors.extend(log["errors"])
+    
+    return DailyReminderStats(
+        date=date,
+        total_executions=len(logs),
+        total_users_processed=total_users,
+        total_messages_sent=total_messages,
+        whatsapp_messages=whatsapp_messages,
+        email_messages=email_messages,
+        errors=all_errors
+    )
+
+@api_router.get("/admin/reminder-logs")
+async def get_reminder_logs(
+    days: int = 7,
+    admin_user: User = Depends(get_admin_user)
+):
+    """Get reminder execution logs for the past N days"""
+    
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days)
+    
+    logs = await db.reminder_logs.find({
+        "date": {
+            "$gte": start_date.isoformat(),
+            "$lte": end_date.isoformat()
+        }
+    }).sort("date", -1).to_list(days * 24)  # Max entries per day
+    
+    return [ReminderLog(**parse_from_mongo(log)) for log in logs]
+
+# Enhanced Admin User Management
+# OLD ADMIN ENDPOINTS - COMMENTED OUT (replaced by new separate admin system)
+# @api_router.get("/admin/users")
+# async def get_all_users_old(admin_user: User = Depends(get_admin_user)):
+#     """Get all users for admin management - OLD ENDPOINT"""
+#     
+#     users = await db.users.find({}).to_list(1000)
+#     
+#     user_list = []
+#     for user in users:
+#         user = parse_from_mongo(user)
+#         # Don't include password hash in response
+#         user.pop("password_hash", None)
+#         
+#         # Get user's contact count
+#         contact_count = await db.contacts.count_documents({"user_id": user["id"]})
+#         user["contact_count"] = contact_count
+#         
+#         # Get user's template count
+#         template_count = await db.templates.count_documents({"user_id": user["id"]})
+#         user["template_count"] = template_count
+#         
+#         # Get message usage statistics
+#         user_messages = await db.reminder_logs.aggregate([
+#             {"$match": {"errors": {"$not": {"$regex": f"user {user['email']}", "$options": "i"}}}},
+#             {"$group": {
+#                 "_id": None,
+#                 "total_whatsapp": {"$sum": "$whatsapp_sent"},
+#                 "total_email": {"$sum": "$email_sent"}
+#             }}
+#         ]).to_list(1)
+#         
+#         if user_messages:
+#             user["total_whatsapp_sent"] = user_messages[0].get("total_whatsapp", 0)
+#             user["total_email_sent"] = user_messages[0].get("total_email", 0)
+#         else:
+#             user["total_whatsapp_sent"] = 0
+#             user["total_email_sent"] = 0
+#         
+#         user_list.append(user)
+#     
+#     return user_list
+
+# @api_router.put("/admin/users/{user_id}")
+# async def update_user_by_admin_old(
+#     user_id: str, 
+#     update_data: dict,
+#     admin_user: User = Depends(get_admin_user)
+# ):
+#     """Update any user's information as admin - OLD ENDPOINT"""
+#    
+#     # Validate user exists
+#     target_user = await db.users.find_one({"id": user_id})
+#     if not target_user:
+#         raise HTTPException(status_code=404, detail="User not found")
+#     
+#     # Prepare update fields
+#     update_fields = {}
+#     
+#     # Allow admin to update basic info
+#     if "full_name" in update_data:
+#         update_fields["full_name"] = update_data["full_name"]
+#     
+#     if "email" in update_data:
+#         # Check if email is already taken by another user
+#         existing_user = await db.users.find_one({
+#             "email": update_data["email"].lower(),
+#             "id": {"$ne": user_id}
+#         })
+#         if existing_user:
+#             raise HTTPException(status_code=400, detail="Email address is already in use")
+#         update_fields["email"] = update_data["email"].lower()
+#     
+#     if "phone_number" in update_data:
+#         update_fields["phone_number"] = update_data["phone_number"]
+#     
+#     # Allow admin to update password
+#     if "password" in update_data:
+#         hashed_password = hash_password(update_data["password"])
+#         update_fields["password_hash"] = hashed_password
+#     
+#     # Allow admin to update admin status
+#     if "is_admin" in update_data:
+#         update_fields["is_admin"] = update_data["is_admin"]
+#     
+#     # Allow admin to update subscription
+#     if "subscription_status" in update_data:
+#         update_fields["subscription_status"] = update_data["subscription_status"]
+#     
+#     # Allow admin to update credits
+#     if "whatsapp_credits" in update_data:
+#         update_fields["whatsapp_credits"] = update_data["whatsapp_credits"]
+#     
+#     if "email_credits" in update_data:
+#         update_fields["email_credits"] = update_data["email_credits"]
+#     
+#     if "unlimited_whatsapp" in update_data:
+#         update_fields["unlimited_whatsapp"] = update_data["unlimited_whatsapp"]
+#     
+#     if "unlimited_email" in update_data:
+#         update_fields["unlimited_email"] = update_data["unlimited_email"]
+#     
+#     if not update_fields:
+#         raise HTTPException(status_code=400, detail="No valid fields to update")
+#     
+#     # Update user
+#     result = await db.users.update_one(
+#         {"id": user_id},
+#         {"$set": update_fields}
+#     )
+#     
+#     if result.modified_count == 0:
+#         raise HTTPException(status_code=404, detail="User not found")
+#     
+#     # Get updated user
+#     updated_user = await db.users.find_one({"id": user_id})
+#     updated_user = parse_from_mongo(updated_user)
+#     updated_user.pop("password_hash", None)  # Don't return password hash
+#     
+#     return {"message": "User updated successfully", "user": updated_user}
+
+# @api_router.delete("/admin/users/{user_id}")
+# async def delete_user_by_admin_old(
+#     user_id: str,
+#     admin_user: User = Depends(get_admin_user)
+# ):
+#     """Delete a user and all their data - OLD ENDPOINT"""
+#     
+#     # Prevent admin from deleting themselves
+#     if user_id == admin_user.id:
+#         raise HTTPException(status_code=400, detail="Cannot delete your own admin account")
+#     
+#     # Check if user exists
+#     target_user = await db.users.find_one({"id": user_id})
+#     if not target_user:
+#         raise HTTPException(status_code=404, detail="User not found")
+#     
+#     # Don't allow deleting admin users (except self-deletion is already prevented above)
+#     if target_user.get('is_admin', False):
+#         raise HTTPException(status_code=400, detail="Cannot delete admin users")
+#     
+#     # Delete user's data
+#     await db.contacts.delete_many({"user_id": user_id})
+#     await db.templates.delete_many({"user_id": user_id})
+#     await db.custom_messages.delete_many({"user_id": user_id})
+#     await db.user_settings.delete_many({"user_id": user_id})
+#     
+#     # Delete user
+#     await db.users.delete_one({"id": user_id})
+#     
+#     return {"message": f"User {target_user['email']} and all associated data deleted successfully"}
+
+@api_router.get("/admin/platform-stats")
+async def get_platform_stats(admin_user: User = Depends(get_admin_user)):
+    """Get comprehensive platform statistics for admin dashboard"""
+    
+    # User statistics
+    total_users = await db.users.count_documents({})
+    active_users = await db.users.count_documents({"subscription_status": "active"})
+    trial_users = await db.users.count_documents({"subscription_status": "trial"})
+    admin_users = await db.users.count_documents({"is_admin": True})
+    
+    # Content statistics
+    total_contacts = await db.contacts.count_documents({})
+    total_templates = await db.templates.count_documents({})
+    total_custom_messages = await db.custom_messages.count_documents({})
+    
+    # Message statistics from logs
+    total_logs = await db.reminder_logs.count_documents({})
+    
+    # Aggregate message statistics
+    message_stats = await db.reminder_logs.aggregate([
+        {
+            "$group": {
+                "_id": None,
+                "total_whatsapp_sent": {"$sum": "$whatsapp_sent"},
+                "total_email_sent": {"$sum": "$email_sent"},
+                "total_messages": {"$sum": "$messages_sent"}
+            }
+        }
+    ]).to_list(1)
+    
+    if message_stats:
+        whatsapp_sent = message_stats[0]["total_whatsapp_sent"]
+        email_sent = message_stats[0]["total_email_sent"]
+        total_messages_sent = message_stats[0]["total_messages"]
+    else:
+        whatsapp_sent = 0
+        email_sent = 0
+        total_messages_sent = 0
+    
+    # Recent activity (last 7 days)
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=7)
+    
+    recent_messages = await db.reminder_logs.aggregate([
+        {
+            "$match": {
+                "date": {
+                    "$gte": start_date.isoformat(),
+                    "$lte": end_date.isoformat()
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "recent_whatsapp": {"$sum": "$whatsapp_sent"},
+                "recent_email": {"$sum": "$email_sent"},
+                "recent_executions": {"$sum": 1}
+            }
+        }
+    ]).to_list(1)
+    
+    if recent_messages:
+        recent_whatsapp = recent_messages[0]["recent_whatsapp"]
+        recent_email = recent_messages[0]["recent_email"]
+        recent_executions = recent_messages[0]["recent_executions"]
+    else:
+        recent_whatsapp = 0
+        recent_email = 0
+        recent_executions = 0
+    
+    return {
+        "users": {
+            "total": total_users,
+            "active": active_users,
+            "trial": trial_users,
+            "admin": admin_users
+        },
+        "content": {
+            "contacts": total_contacts,
+            "templates": total_templates,
+            "custom_messages": total_custom_messages
+        },
+        "messages": {
+            "total_sent": total_messages_sent,
+            "whatsapp_sent": whatsapp_sent,
+            "email_sent": email_sent,
+            "recent_whatsapp": recent_whatsapp,
+            "recent_email": recent_email,
+            "recent_executions": recent_executions
+        },
+        "system": {
+            "total_reminder_logs": total_logs
+        }
+    }
+
+# Admin Setup Route (for initial setup only)
+@api_router.post("/setup-admin")
+async def setup_admin_user():
+    """Setup john@example.com as super admin - for initial setup only"""
+    
+    admin_email = "john@example.com"
+    admin_password = "admin123"
+    
+    # Check if admin already exists
+    existing_admin = await db.users.find_one({"email": admin_email})
+    
+    if existing_admin:
+        # Update existing user to be admin and reset password
+        hashed_password = hash_password(admin_password)
+        await db.users.update_one(
+            {"email": admin_email},
+            {
+                "$set": {
+                    "is_admin": True,
+                    "unlimited_whatsapp": True,
+                    "unlimited_email": True,
+                    "whatsapp_credits": 99999,
+                    "email_credits": 99999,
+                    "subscription_status": "active",
+                    "password_hash": hashed_password
+                }
+            }
+        )
+        return {"message": "Existing user updated with super admin privileges", "email": admin_email, "password": admin_password}
+    else:
+        # Create new admin user
+        hashed_password = hash_password(admin_password)
+        admin_user = User(
+            email=admin_email,
+            full_name="Super Admin",
+            phone_number=None,
+            is_admin=True,
+            subscription_status="active",
+            whatsapp_credits=99999,
+            email_credits=99999,
+            unlimited_whatsapp=True,
+            unlimited_email=True
+        )
+        
+        admin_dict = admin_user.dict()
+        admin_dict["password_hash"] = hashed_password
+        admin_dict = prepare_for_mongo(admin_dict)
+        
+        await db.users.insert_one(admin_dict)
+        return {"message": "Super admin user created successfully", "email": admin_email, "password": admin_password}
+
+# ==================== NEW ADMIN SYSTEM ENDPOINTS ====================
+
+@api_router.get("/admin-auth/captcha", response_model=CaptchaResponse)
+async def get_captcha():
+    """Generate a math captcha for admin login"""
+    captcha_data = generate_math_captcha()
+    return captcha_data
+
+@api_router.post("/admin-auth/setup-first-admin")
+async def setup_first_admin():
+    """Create the first admin account - only works if no admins exist"""
+    # Check if any admin exists
+    existing_admin = await db.admins.find_one({})
+    if existing_admin:
+        raise HTTPException(status_code=400, detail="Admin already exists. Cannot create another admin.")
+    
+    # Generate random credentials
+    username = "admin"
+    password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+    
+    # Hash password
+    hashed_password = hash_password(password)
+    
+    # Create admin
+    admin = AdminUser(username=username)
+    admin_dict = admin.dict()
+    admin_dict["password_hash"] = hashed_password
+    admin_dict = prepare_for_mongo(admin_dict)
+    
+    await db.admins.insert_one(admin_dict)
+    
+    return {
+        "message": "First admin account created successfully",
+        "username": username,
+        "password": password,
+        "warning": "Please save these credentials securely. This is the only time the password will be displayed."
+    }
+
+@api_router.post("/admin-auth/login")
+async def admin_login(
+    username: str,
+    password: str,
+    captcha_id: str,
+    captcha_answer: str
+):
+    """Admin login with captcha verification"""
+    # Verify captcha first
+    if not verify_captcha(captcha_id, captcha_answer):
+        raise HTTPException(status_code=400, detail="Invalid or expired captcha")
+    
+    # Find admin by username
+    admin = await db.admins.find_one({"username": username})
+    if not admin:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    # Verify password
+    if not verify_password(password, admin["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    # Create access token
+    access_token = create_access_token({"admin_id": admin["id"]})
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "admin": {
+            "id": admin["id"],
+            "username": admin["username"]
+        }
+    }
+
+@api_router.get("/admin-auth/me")
+async def get_current_admin_info(current_admin: AdminUser = Depends(get_current_admin)):
+    """Get current admin info"""
+    return current_admin
+
+@api_router.get("/admin/users", response_model=List[UserWithContactCount])
+async def get_all_users_with_contacts(current_admin: AdminUser = Depends(get_current_admin)):
+    """Get all users with their contact counts"""
+    # Get all users
+    users = await db.users.find().to_list(length=None)
+    
+    result = []
+    for user in users:
+        # Count contacts for each user
+        contact_count = await db.contacts.count_documents({"user_id": user["id"]})
+        
+        user_data = {
+            "id": user["id"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "phone_number": user.get("phone_number"),
+            "subscription_status": user.get("subscription_status", "trial"),
+            "whatsapp_credits": user.get("whatsapp_credits", 0),
+            "email_credits": user.get("email_credits", 0),
+            "unlimited_whatsapp": user.get("unlimited_whatsapp", False),
+            "unlimited_email": user.get("unlimited_email", False),
+            "created_at": user.get("created_at", datetime.now(timezone.utc)),
+            "contact_count": contact_count
+        }
+        result.append(user_data)
+    
+    return result
+
+@api_router.put("/admin/users/{user_id}")
+async def update_user_details(
+    user_id: str,
+    update_data: UserUpdateRequest,
+    current_admin: AdminUser = Depends(get_current_admin)
+):
+    """Update user details (name, email, company, phone)"""
+    # Find user
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Prepare update data
+    update_fields = {}
+    if update_data.full_name is not None:
+        update_fields["full_name"] = update_data.full_name.strip()
+    
+    if update_data.email is not None:
+        # Check if email already exists for another user
+        existing_user = await db.users.find_one({"email": update_data.email, "id": {"$ne": user_id}})
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already in use by another user")
+        update_fields["email"] = update_data.email
+    
+    if update_data.phone_number is not None:
+        # Clean and validate phone number (Indian format)
+        phone = update_data.phone_number.strip()
+        if phone:
+            # Remove common formatting
+            phone = re.sub(r'[\s\-\(\)\+]', '', phone)
+            # Remove +91 or 91 prefix
+            if phone.startswith('91') and len(phone) > 10:
+                phone = phone[2:]
+            # Validate 10 digit Indian mobile number (starts with 6-9)
+            if not (len(phone) == 10 and phone.isdigit() and phone[0] in '6789'):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid phone number. Must be 10 digits starting with 6-9"
+                )
+            update_fields["phone_number"] = phone
+        else:
+            update_fields["phone_number"] = None
+    
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    
+    # Update user
+    result = await db.users.update_one(
+        {"id": user_id},
+        {"$set": update_fields}
+    )
+    
+    if result.modified_count == 0 and result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {"message": "User updated successfully", "updated_fields": list(update_fields.keys())}
+
+@api_router.put("/admin/users/{user_id}/subscription")
+async def update_user_subscription(
+    user_id: str,
+    subscription_data: SubscriptionUpdateRequest,
+    current_admin: AdminUser = Depends(get_current_admin)
+):
+    """Update user subscription and credits"""
+    # Find user
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Prepare update data
+    update_fields = {}
+    if subscription_data.subscription_status is not None:
+        update_fields["subscription_status"] = subscription_data.subscription_status
+    
+    if subscription_data.whatsapp_credits is not None:
+        update_fields["whatsapp_credits"] = subscription_data.whatsapp_credits
+    
+    if subscription_data.email_credits is not None:
+        update_fields["email_credits"] = subscription_data.email_credits
+    
+    if subscription_data.unlimited_whatsapp is not None:
+        update_fields["unlimited_whatsapp"] = subscription_data.unlimited_whatsapp
+    
+    if subscription_data.unlimited_email is not None:
+        update_fields["unlimited_email"] = subscription_data.unlimited_email
+    
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    
+    # Update user
+    result = await db.users.update_one(
+        {"id": user_id},
+        {"$set": update_fields}
+    )
+    
+    if result.modified_count == 0 and result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {"message": "Subscription updated successfully", "updated_fields": list(update_fields.keys())}
+
 # Health check
 @api_router.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+# Include the router in the main app (after all endpoints are defined)
+app.include_router(api_router)
