@@ -10,6 +10,8 @@ starlette
 pandas
 setuptools
 python-multipart
+requests
+
 
 
 
