@@ -9,5 +9,7 @@ email-validator
 starlette
 pandas
 setuptools
+python-multipart
+
 
 
