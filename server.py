@@ -45,6 +45,9 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30 * 24 * 60  # 30 days
 # LLM settings
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY')
 
+# Backend URL for image URLs
+BACKEND_URL = os.environ.get('BACKEND_URL', 'http://localhost:8001')
+
 # Admin Captcha Storage (in-memory, for production use Redis)
 captcha_store = {}
 
@@ -1454,6 +1457,24 @@ def get_default_celebration_image(occasion: str = "birthday") -> str:
     }
     return default_images.get(occasion.lower(), default_images["birthday"])
 
+def ensure_absolute_image_url(image_url: Optional[str]) -> Optional[str]:
+    """Convert relative image URLs to absolute URLs using the backend URL"""
+    if not image_url or not image_url.strip():
+        return None
+    
+    image_url = image_url.strip()
+    
+    # If it's already a full URL (starts with http:// or https://), return as is
+    if image_url.startswith('http://') or image_url.startswith('https://'):
+        return image_url
+    
+    # If it's a relative URL starting with /, prepend the backend URL
+    if image_url.startswith('/'):
+        return f"{BACKEND_URL}{image_url}"
+    
+    # If it's a relative path without leading /, assume it's in uploads/images/
+    return f"{BACKEND_URL}/uploads/images/{image_url}"
+
 # WhatsApp Message Sending Functions
 async def send_whatsapp_message(user_id: str, phone_number: str, message: str, image_url: Optional[str] = None, occasion: str = "birthday"):
     """Send WhatsApp message using DigitalSMS API according to official documentation"""
@@ -1485,34 +1506,16 @@ async def send_whatsapp_message(user_id: str, phone_number: str, message: str, i
             "msg": message
         }
         
-        # For now, skip images entirely to isolate the 407 error issue
-        # We'll add image support back once basic messaging works
-        # TODO: Add image support back after resolving 407 error
+        # Handle image URL - convert to absolute URL and add to params
+        absolute_image_url = ensure_absolute_image_url(image_url)
         
-        # Temporarily commenting out image logic:
-        # if image_url and image_url.strip():
-        #     # Convert relative URL to absolute if needed
-        #     if image_url.startswith('/'):
-        #         absolute_image_url = f"https://remindhub-5.preview.emergentagent.com{image_url}"
-        #     elif image_url.startswith('http'):
-        #         absolute_image_url = image_url
-        #     else:
-        #         # Skip image if not a valid URL format
-        #         absolute_image_url = None
-        #     
-        #     # Only add image if we have a valid URL and it's accessible
-        #     if absolute_image_url:
-        #         try:
-        #             import requests
-        #             # Quick HEAD request to check if image is accessible
-        #             head_response = requests.head(absolute_image_url, timeout=5)
-        #             if head_response.status_code == 200:
-        #                 params["img1"] = absolute_image_url
-        #             # If image is not accessible, don't include img1 parameter
-        #         except:
-        #             # If validation fails, don't include img1 parameter
-        #             pass
-        # If no valid image, don't include img1 parameter (send text-only message)
+        # If no image provided, use default celebration image
+        if not absolute_image_url:
+            absolute_image_url = get_default_celebration_image(occasion)
+        
+        # Always include image in WhatsApp message
+        if absolute_image_url:
+            params["img1"] = absolute_image_url
         
         # Log request details for debugging (remove img1 from logs for brevity)
         debug_params = {k: v for k, v in params.items() if k != "img1"}
@@ -1821,6 +1824,11 @@ async def send_test_message(request: TestMessageRequest, current_user: User = De
                 "Content-Type": "application/json"
             }
             
+            # Convert email image to absolute URL
+            absolute_email_image = ensure_absolute_image_url(email_image)
+            if not absolute_email_image:
+                absolute_email_image = get_default_celebration_image(request.occasion)
+            
             # Create HTML email content
             html_content = f"""
             <html>
@@ -1836,7 +1844,7 @@ async def send_test_message(request: TestMessageRequest, current_user: User = De
                         <div style="background-color: white; padding: 15px; border-radius: 6px; border-left: 4px solid #e11d48;">
                             {email_message}
                         </div>
-                        {f'<img src="{email_image}" style="max-width: 100%; height: auto; margin-top: 15px; border-radius: 6px;" alt="Celebration Image">' if email_image else ''}
+                        {f'<img src="{absolute_email_image}" style="max-width: 100%; height: auto; margin-top: 15px; border-radius: 6px;" alt="Celebration Image">' if absolute_email_image else ''}
                     </div>
                     <p style="font-size: 14px; color: #6b7280; margin-top: 30px;">
                         📝 This is a preview of how your {request.occasion} message will appear when sent to {contact['name']}.
@@ -1907,8 +1915,8 @@ async def upload_image(file: UploadFile = File(...), current_user: User = Depend
     with open(file_path, "wb") as buffer:
         buffer.write(file_content)
     
-    # Return full file URL with domain
-    file_url = f"https://remindhub-5.preview.emergentagent.com/uploads/images/{unique_filename}"
+    # Return full file URL with domain (dynamically from environment)
+    file_url = f"{BACKEND_URL}/uploads/images/{unique_filename}"
     return {"image_url": file_url, "filename": unique_filename}
 
 @api_router.put("/contacts/{contact_id}/images")
@@ -2103,6 +2111,11 @@ async def send_email_reminder(user_id: str, contact: dict, occasion: str, messag
             "Content-Type": "application/json"
         }
         
+        # Convert image URL to absolute URL
+        absolute_image_url = ensure_absolute_image_url(image_url)
+        if not absolute_image_url:
+            absolute_image_url = get_default_celebration_image(occasion)
+        
         # Create HTML email content
         html_content = f"""
         <html>
@@ -2115,7 +2128,7 @@ async def send_email_reminder(user_id: str, contact: dict, occasion: str, messag
                     <div style="background-color: white; padding: 15px; border-radius: 6px; border-left: 4px solid #e11d48;">
                         {message}
                     </div>
-                    {f'<img src="{image_url}" style="max-width: 100%; height: auto; margin-top: 15px; border-radius: 6px;" alt="Celebration Image">' if image_url else ''}
+                    {f'<img src="{absolute_image_url}" style="max-width: 100%; height: auto; margin-top: 15px; border-radius: 6px;" alt="Celebration Image">' if absolute_image_url else ''}
                 </div>
                 <p style="font-size: 14px; color: #6b7280; margin-top: 30px;">
                     Sent with ❤️ by ReminderAI
