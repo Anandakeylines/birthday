@@ -1916,7 +1916,7 @@ async def upload_image(file: UploadFile = File(...), current_user: User = Depend
         buffer.write(file_content)
     
     # Return full file URL with domain (dynamically from environment)
-    file_url = f"{BACKEND_URL}/uploads/images/{unique_filename}"
+    file_url = f"/uploads/images/{unique_filename}"
     return {"image_url": file_url, "filename": unique_filename}
 
 @api_router.put("/contacts/{contact_id}/images")
