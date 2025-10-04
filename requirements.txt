@@ -7,5 +7,7 @@ python-jose
 pydantic
 email-validator
 starlette
+pandas
+setuptool
 
 
