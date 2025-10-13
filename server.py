@@ -914,10 +914,10 @@ async def generate_message(request: GenerateMessageRequest, current_user: User =
         
         # Initialize LLM chat with tone-specific system message
         chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"user_{current_user.id}_message_gen_{request.tone}",
-            system_message=tone_config["system"]
-        ).with_model("openai", "gpt-4o")
+        api_key=EMERGENT_LLM_KEY,
+        session_id=f"user_{current_user.id}_message_gen_{request.tone}",
+        system_message=tone_config["system"]
+)
         
         # Create tone-specific prompt
         prompt = f"Generate a {tone_config['style']} {request.occasion} message for {request.contact_name}. "
@@ -937,8 +937,8 @@ async def generate_message(request: GenerateMessageRequest, current_user: User =
         
         prompt += "Keep it between 30-100 words. Do not include greetings like 'Dear' or signatures."
         
-        user_message = UserMessage(text=prompt)
-        response = await chat.send_message(user_message)
+        user_message = UserMessage(content=prompt)
+        response = chat.send_message(user_message)
         
         return MessageResponse(message=response)
         
@@ -1916,7 +1916,7 @@ async def upload_image(file: UploadFile = File(...), current_user: User = Depend
         buffer.write(file_content)
     
     # Return full file URL with domain (dynamically from environment)
-    file_url = f"/uploads/images/{unique_filename}"
+    file_url = f"{BACKEND_URL}/uploads/images/{unique_filename}"
     return {"image_url": file_url, "filename": unique_filename}
 
 @api_router.put("/contacts/{contact_id}/images")
