@@ -1646,6 +1646,7 @@ async def get_custom_message(
     contact_id: str, 
     occasion: str, 
     message_type: str, 
+    image_url:str,
     current_user: User = Depends(get_current_user)
 ):
     """Get a specific custom message for a contact, occasion and message type"""
@@ -1677,7 +1678,7 @@ async def get_custom_message(
             "occasion": occasion,
             "message_type": message_type,
             "custom_message": ai_message.message,
-            "image_url": None,
+            "image_url": image_url,
             "is_default": True
         }
     
