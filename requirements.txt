@@ -1,17 +1,11 @@
 fastapi
 uvicorn
 python-dotenv
-pydantic
-email-validator
-starlette
 motor
 bcrypt
 python-jose
-setuptools
-pandas
-pytz
-aiofiles
-python-multipart
-requests
+pydantic
+email-validator
+starlette
 
 

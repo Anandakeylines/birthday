@@ -935,7 +935,7 @@ async def generate_message(request: GenerateMessageRequest, current_user: User =
         elif request.tone == "casual":
             prompt += "Keep it simple, laid-back, and easy-going. "
         
-        prompt += "Keep it between 30-100 words. Do not include greetings like 'Dear' or signatures."
+        prompt += "Keep it between 30-50 words. Do not include greetings like 'Dear' or signatures."
         
         user_message = UserMessage(content=prompt)
         response = chat.send_message(user_message)
